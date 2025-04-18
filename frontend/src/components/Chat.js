@@ -1,0 +1,385 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { useParams, useNavigate } from 'react-router-dom';
+import api from '../api';
+
+function Chat() {
+  const { sessionId } = useParams();
+  const navigate = useNavigate();
+
+  const [sessions, setSessions] = useState([]); // sidebar sessions
+  const [kbs, setKbs] = useState([]);
+  const [selectedKb, setSelectedKb] = useState(null);
+  const [promptText, setPromptText] = useState('');
+  const [promptBoxVisible, setPromptBoxVisible] = useState(false);
+
+  // reference to chat body div for auto‑scroll
+  const chatBodyRef = useRef(null);
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState('');
+  const [currentSessionId, setCurrentSessionId] = useState(sessionId);
+
+  /* ------------------------------------------------------------------ */
+  /* Load sidebar sessions                                              */
+  /* ------------------------------------------------------------------ */
+  const loadSessions = async () => {
+    try {
+      const response = await api.get('/history/sessions');
+      setSessions(response.data);
+    } catch (err) {
+      console.error('Failed to fetch sessions', err);
+    }
+  };
+
+  /* Load list of knowledge bases */
+  const loadKbs = async () => {
+    try {
+      const resp = await api.get('/kb/list');
+      setKbs(resp.data);
+    } catch (err) {
+      console.error('Failed to fetch KBs', err);
+    }
+  };
+
+  /* -------------------------- Upload PDF --------------------------- */
+  const handlePdfUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      await api.post('/kb/upload', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      await loadKbs();
+      e.target.value = '';
+    } catch (err) {
+      console.error('Upload failed', err);
+      alert('Failed to upload PDF');
+    }
+  };
+
+  /* ------------------------------------------------------------------ */
+  /* Load messages for a given session                                  */
+  /* ------------------------------------------------------------------ */
+  const loadHistory = async (sid) => {
+    if (!sid) return;
+    try {
+      const response = await api.get(`/history?session_id=${sid}`);
+      setMessages(response.data);
+      setCurrentSessionId(sid);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  /* ------------------------------------------------------------------ */
+  /* Effect: when session param changes, load messages                  */
+  /* ------------------------------------------------------------------ */
+  useEffect(() => {
+    if (sessionId) {
+      loadHistory(sessionId);
+    } else {
+      // new chat window
+      setMessages([]);
+      setCurrentSessionId(null);
+    }
+    // refresh sessions + KB lists whenever route changes
+    loadSessions();
+    loadKbs();
+  }, [sessionId]);
+
+  // load KB list once on mount
+  useEffect(() => {
+    loadKbs();
+  }, []);
+
+  /* Auto‑scroll to bottom whenever messages change */
+  useEffect(() => {
+    const div = chatBodyRef.current;
+    if (div) {
+      div.scrollTop = div.scrollHeight;
+    }
+  }, [messages]);
+
+  /* ------------------------------------------------------------------ */
+  /* Send a message                                                     */
+  /* ------------------------------------------------------------------ */
+  const handleSend = async (e) => {
+    e.preventDefault();
+    if (!input.trim()) return;
+
+    const userMessage = { role: 'user', content: input };
+    setMessages((prev) => [...prev, userMessage]);
+    setInput(''); // clear field immediately
+
+    try {
+      // streaming fetch instead of axios to gain access to ReadableStream
+      const token = localStorage.getItem('token');
+      const headers = { 'Content-Type': 'application/json' };
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+
+      const base = api.defaults?.baseURL || '';
+      const response = await fetch(base + '/chat/stream', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ session_id: currentSessionId, kb_id: selectedKb, message: input }),
+      });
+
+      if (!response.ok || !response.body) {
+        throw new Error('Network response was not ok');
+      }
+
+      // add placeholder assistant message that we'll update as tokens arrive.
+      let assistantContent = '';
+      setMessages((prev) => [...prev, { role: 'assistant', content: '' }]);
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+
+      const processLine = (line) => {
+        if (!line.trim()) return;
+        try {
+          const obj = JSON.parse(line);
+          if (obj.session_id) {
+            // new session created by backend
+            if (obj.session_id !== currentSessionId) {
+              setCurrentSessionId(obj.session_id);
+              navigate(`/chat/${obj.session_id}`, { replace: true });
+            }
+          } else if (obj.token) {
+            assistantContent += obj.token;
+            setMessages((prev) => {
+              const newArr = [...prev];
+              newArr[newArr.length - 1] = { role: 'assistant', content: assistantContent };
+              return newArr;
+            });
+          } else if (obj.done) {
+            loadSessions(); // refresh sidebar order
+          }
+        } catch (e) {
+          console.error('Failed to parse line', line, e);
+        }
+      };
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let lines = buffer.split('\n');
+        buffer = lines.pop();
+        lines.forEach(processLine);
+      }
+      // process any remaining buffered data
+      buffer += decoder.decode();
+      if (buffer) {
+        const lines = buffer.split('\n');
+        lines.forEach(processLine);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  /* ------------------------------------------------------------------ */
+  /* UI RENDER                                                          */
+  /* ------------------------------------------------------------------ */
+  const handleSessionClick = (sid) => {
+    if (sid === currentSessionId) return;
+    navigate(`/chat/${sid}`);
+  };
+
+  const startNewChat = () => {
+    navigate('/chat'); // route without session id
+  };
+
+  /* ------------------------ System Prompt ------------------------- */
+
+  const loadPrompt = async () => {
+    if (!currentSessionId) return;
+    try {
+      const resp = await api.get(`/history/${currentSessionId}/prompt`);
+      setPromptText(resp.data.prompt || '');
+    } catch (err) {
+      console.error('Failed to load prompt', err);
+    }
+  };
+
+  const savePrompt = async () => {
+    try {
+      await api.put(`/history/${currentSessionId}/prompt`, { prompt: promptText });
+      // nothing else
+    } catch (err) {
+      console.error('Failed to save prompt', err);
+    }
+  };
+
+  return (
+    <>
+    <div className="h-screen flex bg-background text-gray-100">
+      {/* Sidebar */}
+      <aside className="w-60 bg-sidebar flex-shrink-0 flex flex-col overflow-y-auto">
+        <div className="p-4 border-b border-gray-700">
+            <div className="flex justify-between items-center mb-2">
+              <h2 className="text-sm font-semibold tracking-wide uppercase text-gray-300">Conversations</h2>
+              <button
+                className="text-accent hover:opacity-80 text-sm"
+                onClick={startNewChat}
+                title="Start new chat"
+              >
+                + New
+              </button>
+            </div>
+            <div className="flex items-center gap-2 mb-2">
+              <label className="text-xs text-gray-300 cursor-pointer hover:text-accent">
+                Upload PDF
+                <input
+                  type="file"
+                  accept="application/pdf"
+                  style={{ display: 'none' }}
+                  onChange={handlePdfUpload}
+                />
+              </label>
+            </div>
+            {kbs.length > 0 && (
+              <div className="mb-2">
+                <select
+                  className="text-sm bg-gray-800 border border-gray-600 rounded w-full p-1 text-gray-100"
+                  value={selectedKb || ''}
+                  onChange={(e) => setSelectedKb(e.target.value || null)}
+                >
+                  <option value="">— Knowledge Base: none —</option>
+                  {kbs.map((kb) => (
+                    <option key={kb.kb_id} value={kb.kb_id}>
+                      {kb.filename.length > 25 ? kb.filename.slice(0, 25) + '…' : kb.filename}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+          </div>
+          <ul className="space-y-1 px-2 py-2">
+            {sessions.length === 0 && (
+              <li className="text-xs text-gray-400">No conversations yet.</li>
+            )}
+            {sessions.map((sess) => (
+              <li
+                key={sess.session_id || sess.sessionId}
+                className={`group text-sm rounded px-3 py-2 cursor-pointer flex justify-between items-center hover:bg-gray-700 ${
+                  (sess.session_id || sess.sessionId) === currentSessionId ? 'bg-gray-700' : ''
+                }`}
+              >
+                <div className="flex-1 pr-2" onClick={() => handleSessionClick(sess.session_id || sess.sessionId)}>
+                  <p className="truncate text-gray-100">
+                    {(sess.last_message || sess.lastMessage).slice(0, 40) || 'New conversation'}
+                  </p>
+                  <span className="text-[10px] text-gray-400">
+                    {new Date(sess.timestamp).toLocaleString()}
+                  </span>
+                </div>
+                <button
+                  className="text-gray-400 hover:text-red-500 opacity-0 group-hover:opacity-100 text-xs"
+                  title="Delete conversation"
+                  onClick={async (e) => {
+                    e.stopPropagation();
+                    if (!window.confirm('Delete this conversation?')) return;
+                    try {
+                      await api.delete(`/history/${sess.session_id || sess.sessionId}`);
+                      if ((sess.session_id || sess.sessionId) === currentSessionId) {
+                        navigate('/chat');
+                      }
+                      loadSessions();
+                    } catch (err) {
+                      console.error('Delete failed', err);
+                    }
+                  }}
+                >
+                  ×
+                </button>
+              </li>
+            ))}
+          </ul>
+      {/* Chat panel */}
+      </aside>
+      <main className="flex-1 flex flex-col h-full">
+          <div className="flex justify-end items-center border-b border-gray-700 px-4 py-2">
+            {currentSessionId && (
+              <button
+                className="text-xs px-3 py-1 border border-gray-500 rounded hover:bg-gray-700"
+                onClick={async () => {
+                  if (!promptBoxVisible) await loadPrompt();
+                  setPromptBoxVisible((v) => !v);
+                }}
+                title="Toggle system prompt box"
+              >
+                {promptBoxVisible ? 'Hide Prompt' : 'Show Prompt'}
+              </button>
+            )}
+          </div>
+          {promptBoxVisible && (
+            <div className="p-4 border-b border-gray-700 bg-sidebar">
+              <textarea
+                className="w-full bg-gray-800 border border-gray-600 rounded p-2 text-sm text-gray-100 focus:outline-none resize-none"
+                rows="4"
+                value={promptText}
+                onChange={(e) => setPromptText(e.target.value)}
+                placeholder="Enter system prompt for this conversation..."
+              />
+              <div className="text-right mt-2">
+                <button
+                  className="bg-accent text-white text-xs px-3 py-1 rounded hover:opacity-90"
+                  onClick={savePrompt}
+                  disabled={!currentSessionId}
+                >
+                  Save Prompt
+                </button>
+              </div>
+            </div>
+          )}
+
+          <div
+            ref={chatBodyRef}
+            className="flex-1 overflow-y-auto p-4 space-y-2"
+          >
+            {messages.map((msg, idx) => (
+              <div
+                key={idx}
+                className={`flex mb-3 ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+              >
+                <div
+                  className={`rounded-md text-sm leading-relaxed max-w-[75%] px-4 py-2 whitespace-pre-wrap ${
+                    msg.role === 'user'
+                      ? 'bg-background border border-gray-600'
+                      : 'bg-assistant'
+                  }`}
+                >
+                  {msg.content}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="border-t border-gray-700 p-3">
+            <form className="flex gap-2" onSubmit={handleSend}>
+              <input
+                type="text"
+                className="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-gray-100 focus:outline-none"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder="Type your message..."
+                required
+              />
+              <button className="bg-accent text-white px-4 py-2 rounded hover:opacity-90" type="submit">
+                Send
+              </button>
+            </form>
+          </div>
+        </main>
+    </div>
+
+    {/* no modal */}
+    </>
+  );
+}
+
+export default Chat;
