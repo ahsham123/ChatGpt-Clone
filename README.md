@@ -5,6 +5,7 @@ cd frontend
 npm install
 npm start
 
+
 cd ../app
 python -m venv env
 env/Scripts/activate
